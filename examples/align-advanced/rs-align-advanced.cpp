@@ -28,10 +28,15 @@ int main(int argc, char * argv[]) try
 
     // Create a pipeline to easily configure and start the camera
     rs2::pipeline pipe;
+
+    //: open device from the recorded bag file
+    rs2::config cfg;
+    cfg.enable_device_from_file("/path/to/file.bag");
+
     //Calling pipeline's start() without any additional parameters will start the first device
     // with its default streams.
     //The start function returns the pipeline profile which the pipeline used to start the device
-    rs2::pipeline_profile profile = pipe.start();
+    rs2::pipeline_profile profile = pipe.start(cfg);
 
     // Each depth camera might have different units for depth pixels, so we get it here
     // Using the pipeline's profile, we can retrieve the device that the pipeline uses
