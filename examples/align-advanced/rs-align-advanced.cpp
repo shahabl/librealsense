@@ -6,6 +6,9 @@
 #include <imgui.h>
 #include "imgui_impl_glfw.h"
 
+#include <opencv2/opencv.hpp>   // Include OpenCV API
+#include <opencv2/rgbd.hpp>     // OpenCV RGBD Contrib package
+
 #include <sstream>
 #include <iostream>
 #include <fstream>
@@ -13,7 +16,7 @@
 #include <cstring>
 
 void render_slider(rect location, float& clipping_dist);
-void remove_background(rs2::video_frame& other, const rs2::depth_frame& depth_frame, float depth_scale, float clipping_dist);
+void remove_background(rs2::video_frame& other_frame, const cv::Mat& depth_frame, cv::Mat& new_background, float depth_scale, float clipping_dist);
 float get_depth_scale(rs2::device dev);
 rs2_stream find_stream_to_align(const std::vector<rs2::stream_profile>& streams);
 bool profile_changed(const std::vector<rs2::stream_profile>& current, const std::vector<rs2::stream_profile>& prev);
@@ -26,12 +29,24 @@ int main(int argc, char * argv[]) try
     rs2::colorizer c;                     // Helper to colorize depth images
     texture renderer;                     // Helper for renderig images
 
+    //Create a depth cleaner instance
+    cv::rgbd::DepthCleaner* depthc = new cv::rgbd::DepthCleaner(CV_16U, 7, cv::rgbd::DepthCleaner::DEPTH_CLEANER_NIL);
+
     // Create a pipeline to easily configure and start the camera
     rs2::pipeline pipe;
+
+    // open device from the recorded bag file
+    rs2::config cfg;
+    cfg.enable_device_from_file("/home/ubuntu/Downloads/500-out-1.bag");
+
+    // background replacement image
+    cv::Mat newBackgroundImg = cv::imread("/home/ubuntu/Downloads/beach.jpg", cv::IMREAD_COLOR);
+    cv::Mat resizedBackground;
+
     //Calling pipeline's start() without any additional parameters will start the first device
     // with its default streams.
     //The start function returns the pipeline profile which the pipeline used to start the device
-    rs2::pipeline_profile profile = pipe.start();
+    rs2::pipeline_profile profile = pipe.start(cfg);
 
     // Each depth camera might have different units for depth pixels, so we get it here
     // Using the pipeline's profile, we can retrieve the device that the pipeline uses
@@ -47,7 +62,7 @@ int main(int argc, char * argv[]) try
     rs2::align align(align_to);
 
     // Define a variable for controlling the distance to clip
-    float depth_clipping_distance = 1.f;
+    float depth_clipping_distance = 1.2f;
 
     while (app) // Application still alive?
     {
@@ -78,10 +93,35 @@ int main(int argc, char * argv[]) try
         {
             continue;
         }
+
+        // Clean and inpaint the depth frame
+        // Code segments from: https://github.com/juniorxsound/ThreadedDepthCleaner
+
+        // Query frame size (width and height)
+        const int w1 = aligned_depth_frame.as<rs2::video_frame>().get_width();
+        const int h1 = aligned_depth_frame.as<rs2::video_frame>().get_height();
+
+        // Create an openCV matrix from the raw depth (CV_16U holds a matrix of 16bit unsigned ints)
+        cv::Mat rawDepthMat(cv::Size(w1, h1), CV_16U, (void*) aligned_depth_frame.get_data());
+
+        // Create an openCV matrix for the DepthCleaner instance to write the output to
+        cv::Mat cleanedDepth(cv::Size(w1, h1), CV_16U);
+
+        //Run the RGBD depth cleaner instance
+        depthc->operator()(rawDepthMat, cleanedDepth);
+
+        // Inpaint only the masked "unknown" pixels
+        cv::Mat paintedDepth;        
+        cv::inpaint(cleanedDepth, (cleanedDepth == 0), paintedDepth, 5.0, cv::INPAINT_TELEA);
+
+        // resize the new background image only once
+        if(resizedBackground.rows != h1 || resizedBackground.cols != w1) {
+            cv::resize(newBackgroundImg, resizedBackground, cv::Size(w1, h1));
+        }
         // Passing both frames to remove_background so it will "strip" the background
         // NOTE: in this example, we alter the buffer of the other frame, instead of copying it and altering the copy
         //       This behavior is not recommended in real application since the other frame could be used elsewhere
-        remove_background(other_frame, aligned_depth_frame, depth_scale, depth_clipping_distance);
+        remove_background(other_frame, paintedDepth, resizedBackground, depth_scale, depth_clipping_distance);
 
         // Taking dimensions of the window for rendering purposes
         float w = static_cast<float>(app.width());
@@ -176,10 +216,11 @@ void render_slider(rect location, float& clipping_dist)
     ImGui::End();
 }
 
-void remove_background(rs2::video_frame& other_frame, const rs2::depth_frame& depth_frame, float depth_scale, float clipping_dist)
+void remove_background(rs2::video_frame& other_frame, const cv::Mat& depth_frame, cv::Mat& new_background, float depth_scale, float clipping_dist)
 {
-    const uint16_t* p_depth_frame = reinterpret_cast<const uint16_t*>(depth_frame.get_data());
+    const uint16_t* p_depth_frame = reinterpret_cast<const uint16_t*>(depth_frame.data);
     uint8_t* p_other_frame = reinterpret_cast<uint8_t*>(const_cast<void*>(other_frame.get_data()));
+    uchar* p_new_background = new_background.data;
 
     int width = other_frame.get_width();
     int height = other_frame.get_height();
@@ -195,13 +236,19 @@ void remove_background(rs2::video_frame& other_frame, const rs2::depth_frame& de
             auto pixels_distance = depth_scale * p_depth_frame[depth_pixel_index];
 
             // Check if the depth value is invalid (<=0) or greater than the threashold
-            if (pixels_distance <= 0.f || pixels_distance > clipping_dist)
+            if (pixels_distance > clipping_dist)
             {
                 // Calculate the offset in other frame's buffer to current pixel
                 auto offset = depth_pixel_index * other_bpp;
 
                 // Set pixel to "background" color (0x999999)
-                std::memset(&p_other_frame[offset], 0x99, other_bpp);
+                //std::memset(&p_other_frame[offset], 0x99, other_bpp);
+
+                // use pixels from the new background image 
+                // converting RGB to BGR
+                p_other_frame[offset] = p_new_background[offset+2];
+                p_other_frame[offset+1] = p_new_background[offset+1];
+                p_other_frame[offset+2] = p_new_background[offset];
             }
         }
     }
